@@ -1,0 +1,253 @@
+---
+title: "Proteomics Analysis"
+author: "Rutkovskaya Ekaterina"
+date: "2024-04-20"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(readxl)
+library(limma)
+library(ape)
+library(dendextend)
+library(RColorBrewer)
+library(pvclust)
+library(gplots)
+library(NMF)
+library(vegan)
+library(Biobase)
+library(DT)
+library(ggplot2)
+library(impute)
+library(ggrepel)
+library(org.Hs.eg.db) 
+library(clusterProfiler) 
+```
+
+# Data preparation
+```{r, message=FALSE, warning=FALSE}
+experiment <- read.csv("peaks_data.csv", head = T)
+experiment<-experiment[ , 3:36]
+experiment$low_value <- rowSums(experiment[, 2:34])
+
+#removing proteins with too much NA's
+low_value <- experiment$Gene_id[(which(rowSums(is.na(experiment)) > ncol(experiment)/2))]
+exp_filtered <- experiment[!(experiment$Gene_id%in% low_value), -35]
+exp_total<-exp_filtered[ ,2:34]
+
+#removing duplicates
+duplicates<-exp_filtered$Gene_id[which(duplicated(exp_filtered$Gene_id))]
+which(exp_filtered$Gene_id=="GNAS")
+which(exp_filtered$Gene_id=="NACA")
+exp_filtered<-exp_filtered[-c(817, 1258), ]
+exp_total<-exp_total[-c(817, 1258), ]
+row.names(exp_total) <-exp_filtered$Gene_id
+```
+
+# Classification 
+```{r, message=FALSE, warning=FALSE}
+exp_matrix<- as.matrix(exp_total)
+matrix_trans <- t(exp_matrix)
+knn_exp <- impute.knn(matrix_trans, k = 5)
+knn_exp <- knn_exp$data
+knn_exp <- as.data.frame(knn_exp)
+knn_exp <- t(as.matrix(knn_exp))
+```
+
+# Data normalization
+```{r, message=FALSE, warning=FALSE}
+#boxplot
+pal <- brewer.pal(n = 9, name = "Set1")
+cols <- pal[as.factor(c("1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2"))]
+boxplot(knn_exp, outline = FALSE, main = "Pre-normalized data", col = cols)
+
+#normalization
+exp_log2<- log2(knn_exp+1)
+exp_norm<- normalizeQuantiles(as.matrix(exp_log2))
+boxplot(exp_norm, outline = FALSE, main = "Normalized data", col = cols)
+```
+
+# PCA 
+
+After data processing we see no clear signs of batch-effects: two groups are very well distinguished and any outliers are not visible
+```{r, message=FALSE, warning=FALSE}
+exp_pca <- t(exp_norm)
+terapod_pca <- rda(exp_pca, scale = TRUE)
+df_scores <- data.frame(exp_pca,
+                        scores(terapod_pca, display = "sites", choices = c(1, 2, 3), scaling = "sites"))
+
+p_scores <- ggplot(df_scores, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(color = rownames(exp_pca)), alpha = 0.5) +
+  coord_equal(xlim = c(-3, 3), ylim = c(-3, 3)) + ggtitle(label = "Ordination") + theme_bw()
+p_scores
+```
+
+# Evaluating the amount of differential expressed proteints
+```{r, message=FALSE, warning=FALSE}
+maplot <- function(X1, X2, pch = 21, main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", lpars = list(col = "blue", lwd = 2), ...){
+  X <- (rowMeans(X2) + rowMeans(X1)) / 2
+  Y <- rowMeans(X2) - rowMeans(X1)
+  scatter.smooth(x = X, y = Y, main = main, pch = pch, xlab = xlab, ylab = ylab, lpars = lpars, ...)
+  abline(h = c(-1, 0, 1), lty = c(2, 1, 2))
+}
+
+maplot(exp_norm[,1:14], exp_norm[,15:33])
+```
+
+# Data preprocessing
+```{r, message=FALSE, warning=FALSE}
+expr_data <- as.matrix(exp_norm)
+
+groups<-as.factor(as.factor(c("1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "1", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2", "2")))
+pheno_data <- data.frame(groups)
+rownames(pheno_data) <- colnames(exp_norm)
+pheno_metadata <- data.frame(
+  labelDescription = c("Experimental condition"),
+  row.names=c("Condition"))
+pheno_data <- new("AnnotatedDataFrame",
+                  data = pheno_data,
+                  varMetadata = pheno_metadata)
+
+feature_data <- data.frame(Prot = rownames(expr_data))
+rownames(feature_data) <- rownames(expr_data)
+feature_metadata <- data.frame(
+  labelDescription = c("Protein name"),
+  row.names = c("Protein"))
+f_data <- new("AnnotatedDataFrame",
+              data = feature_data,
+              varMetadata = feature_metadata)
+
+
+exp_set <-
+  ExpressionSet(assayData = expr_data,
+                phenoData = pheno_data,
+                featureData = f_data)
+```
+
+# Performing differential expression
+```{r, message=FALSE, warning=FALSE}
+X <- model.matrix(~ groups, pData(exp_set))
+fit <- lmFit(exp_set, design = X, method = "robust", maxit = 1000)
+efit <- eBayes(fit)
+
+MA_limma <- function(efit, coef, n = 10, signif = TRUE, fdr = 0.05, lfc = 0, text = TRUE, cex.text = 0.8, col.text = "grey20", main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", pch = 19, pch.signif = 21, col = "darkgreen", alpha = 0.3, cex = 0.3, ...){
+  R <- efit$coefficients[, coef]
+  I <- efit$Amean
+  col_btransp <- adjustcolor(col, alpha.f = alpha)
+  plot(I, R, cex = cex, main = main, pch = pch, xlab = xlab, ylab = ylab, col = col_btransp, ...)
+  abline(h = 0)
+  if(signif){
+    sign <- p.adjust(efit$p.value[, coef], method = "BH") <= fdr
+    large <- abs(efit$coefficients[, coef]) >= lfc
+    points(I[sign & large], R[sign & large], cex = cex*2, col = "orange2", pch = pch.signif)
+  }
+  if(text){
+    ord <- order(efit$lods[, coef], decreasing = TRUE)
+    top_n <- ord[1:n]
+    text(I[top_n], R[top_n], labels = efit$genes[top_n, ], pos = 4, cex = cex.text, col = col.text)
+  }
+}
+
+
+MA_limma(efit, coef = 2, n = 30)
+
+topP <- topTable(efit, coef = 2, n = 100)
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% topP$Prot, ]
+
+```
+
+# Visualizing diffential expression - heatmap
+```{r, message=FALSE, warning=FALSE, fig.height=10, fig.width=15}
+dat <- as.matrix(exprs(dif_exp_set))
+pal_blue_red <- colorpanel(75, low = "steelblue", mid = "black", high = "red")
+heatmap.2(dat, col = pal_blue_red, scale = "row", key = TRUE, symkey = FALSE, density.info = "none", trace = "none", cexRow = 0.9, cexCol = 1, margins = c(4, 3), keysize = 0.8, key.par = list(mar = c(3, 0.1, 3, 0.1))) 
+```
+
+# Choosing significant proteins
+```{r, message=FALSE, warning=FALSE}
+topTable(efit, coef = 2)
+numGenes <- nrow(exprs(exp_set))
+full_list <- topTable(efit, number = numGenes)
+full_list <- full_list[full_list$adj.P.Val <= 0.05,]
+write.csv(full_list, "C:/Users/rutko/Desktop/all_R/ITMO/proteomics/DE_full.csv")
+
+MA_limma(efit, coef = 2, n = 4)
+MA_limma(efit, coef = 2, n = 80, text = F, lfc = 1)
+
+DE_list <- full_list
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% DE_list$Prot, ]
+```
+
+# Visualizing diffential expression - volcano 
+```{r, message=FALSE, warning=FALSE}
+volcano_list <- full_list
+volcano1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point()
+volcano2 <- volcano1 + geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red")
+volcano_list$diffexpressed <- "NO" 
+volcano_list$diffexpressed[volcano_list$logFC > 1 & volcano_list$adj.P.Val < 0.05] <- "UP"
+volcano_list$diffexpressed[volcano_list$logFC < -1 & volcano_list$adj.P.Val< 0.05] <- "DOWN"
+
+volcanodif1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val), col = diffexpressed)) + geom_point() + theme_minimal()
+volcanodif2 <- volcanodif1 + geom_vline(xintercept=c(-1, 1), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red")
+
+volcano_list$Prot <- as.character(volcano_list$Prot)
+volcano_list$delabel <- NA
+
+
+plot_proteins <- ggplot(data=volcano_list, aes(x=logFC, y=-log10(adj.P.Val), col=diffexpressed, label=delabel)) + 
+  geom_point() + 
+  theme_minimal() +
+  geom_text_repel(size=3, colour = 'black', max.overlaps = 30)
+
+plot_final <- plot_proteins + geom_vline(xintercept=c(-1, 1), col="red") + geom_hline(yintercept=-log10(0.05), col="red")
+plot_final
+```
+
+# Identification of UP and DOWN regulated proteins
+```{r, message=FALSE, warning=FALSE}
+diff_prot <- rownames(full_list)
+diff_expressed <- as.data.frame(exp_norm)[diff_prot,]
+t_diff_expressed <- t(diff_expressed)
+
+
+d <- dist(x = t_diff_expressed, method = "canberra")
+
+hc_avg <- hclust(d, method = "average")
+ph_avg <- as.phylo(hc_avg)
+den_avg <- as.dendrogram(hc_avg)
+
+get_colours <- function(dend, n_chars, palette = "Dark2"){ 
+  labs <- get_leaves_attr(dend, "label")
+  group <- substr(labs, start = 0, stop = n_chars)
+  group <- factor(group)
+  cols <- brewer.pal(length(levels(group)), name = palette)[group]
+  return(cols)
+}
+
+cols <- get_colours(dend = den_avg, n_chars = 6)
+den_avg_c <- color_labels(dend = den_avg, col = cols)
+plot(den_avg_c, horiz = TRUE)
+```
+
+# Protein annotaion - GO enrich 
+
+Among UP regulated proteins we find those, which involved in response to some toxic substances, especially to doxorubicin, which is known to its cardiotoxic effects. Also we see proteins from electronic transport chain and their dysregulation can be seen as a marker of oxidative stress. Increased oxidative stress can accelerate calcium deposition in the valves.
+```{r, message=FALSE, warning=FALSE}
+up_reg = full_list$Prot[(full_list$logFC>2 & full_list$adj.P.Val<0.05)]  
+GO_enrich <- enrichGO(up_reg, "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP") 
+head(GO_enrich@result)  
+dotplot(GO_enrich, showCategory = 20)  
+
+```
+
+On the other hand, among DOWN regulated proteins we see those, which are crucial to cell maintainance, including actin production, RNA splicing and vesicle organization. 
+```{r, message=FALSE, warning=FALSE}
+down_reg = full_list$Prot[(full_list$logFC<2 & full_list$adj.P.Val<0.05)]  
+GO_enrich <- enrichGO(down_reg, "org.Hs.eg.db", keyType = "SYMBOL", ont = "BP") 
+head(GO_enrich@result)  
+dotplot(GO_enrich, showCategory = 20)  
+```
